@@ -1,21 +1,31 @@
 def build_instructor_input(state):
+
     ocr = state.get("ocr_text", "")
     context = state.get("context", "")
+    page = state.get("page", "unknown")
+
     messages = state.get("messages", [])
 
     last_message = ""
     if messages:
-        last_message = messages[-1].content
+        for msg in reversed(messages):
+            if hasattr(msg, "content") and isinstance(msg.content, str):
+                last_message = msg.content
+                break
 
     return f"""
-    Страница: {state.get("page")}
+Ты получаешь данные анализа инженерного чертежа.
 
-    OCR:
-    {state.get("ocr_text", "")}
+Страница: {page}
 
-    Контекст:
-    {state.get("context", "")}
+[OCR]
+{ocr}
 
-    Анализ агента:
-    {state["messages"][-1].content if state["messages"] else ""}
-    """
+[Контекст]
+{context}
+
+[Анализ агента]
+{last_message}
+
+Используй только эти данные.
+"""
