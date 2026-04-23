@@ -16,3 +16,5 @@ torch
 torchvision
 ultralytics 
 opencv-python
+hydra-core
+pdf2image
