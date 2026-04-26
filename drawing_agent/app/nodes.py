@@ -34,7 +34,7 @@ def preprocess_node(state: AgentState, cfg: DictConfig) -> AgentState:
         
         state["messages"].insert(0, AIMessage(content=state['drawing_context']))
         state["analysis_complete"] = True
-        logger.info(f'Чертеж загружен: {state['drawing_width']}x{state['drawing_height']}')
+        logger.info(f"Чертеж загружен: {state['drawing_width']}x{state['drawing_height']}")
         log_to_clearml(f"Чертеж загружен: {state['drawing_width']}x{state['drawing_height']}")
         
     except Exception as e:

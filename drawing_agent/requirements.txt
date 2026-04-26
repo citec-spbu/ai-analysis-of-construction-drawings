@@ -12,9 +12,8 @@ python-dotenv
 clearml
 typing-extensions
 pydantic
-torch
-torchvision
-ultralytics 
-opencv-python
+ultralytics
 hydra-core
 pdf2image
+faiss-cpu
+sentence-transformers
