@@ -1,4 +1,3 @@
-/* eslint-disable react-hooks/set-state-in-effect */
 import { IoArrowBackSharp, IoChatbubbleEllipses } from 'react-icons/io5';
 import Button from '../../UI/Button';
 import { useNavigate, useParams } from 'react-router';
@@ -9,30 +8,48 @@ import {
     useGetDrawingQuery,
     useLazyGetDrawingQuery,
 } from '../../store/api/drawings';
-import { toast, ToastContainer } from 'react-toastify';
+import { ToastContainer } from 'react-toastify';
 import Chat from './Chat';
 import { useEffect, useState, type SubmitEventHandler } from 'react';
 import { useDeleteDrawing } from '../../hooks/useDeleteDrawing';
+import useWebsocket from '../../hooks/useWebsocket';
 
 const DrawingPage = () => {
     const navigate = useNavigate();
     const params = useParams<{ id: string }>();
+    const [question, setQuestion] = useState<string>('');
     const { isLoading, handleDelete } = useDeleteDrawing(params.id!, navigate);
-    const { data, isError } = useGetDrawingQuery(
+    const [pendingRequest, setPendingRequest] = useState<boolean>(false);
+    const { data, isError, refetch } = useGetDrawingQuery(
         {
             id: params.id!,
         },
-        { refetchOnMountOrArgChange: true },
+        {
+            refetchOnFocus: true,
+            refetchOnMountOrArgChange: true,
+            refetchOnReconnect: true,
+        },
     );
     const [triggerGetDrawing] = useLazyGetDrawingQuery();
-
     const [askQuestion] = useAskQuestionMutation();
-    const [question, setQuestion] = useState<string>('');
-    console.log(data);
+    useWebsocket(params, refetch);
+
+    useEffect(() => {
+        if (data && data.status !== 'processing') return;
+
+        const interval = window.setInterval(() => {
+            refetch();
+        }, 3000);
+
+        return () => {
+            window.clearInterval(interval);
+        };
+    }, [data?.status, refetch]);
 
     const askHandler: SubmitEventHandler<HTMLFormElement> = async (e) => {
         e.preventDefault();
         try {
+            setPendingRequest(true);
             await askQuestion({
                 id: params.id!,
                 question,
@@ -41,46 +58,10 @@ const DrawingPage = () => {
         } catch (error) {
             console.log(error);
         } finally {
+            setPendingRequest(false);
             setQuestion('');
         }
     };
-
-    useEffect(() => {
-        if (!params.id) return;
-
-        const ws = new WebSocket(`ws://localhost:8000/ws/${params.id}`);
-
-        ws.onopen = () => {
-            console.log('WS connected');
-        };
-
-        ws.onerror = (e) => {
-            console.log('WS error', e);
-        };
-
-        ws.onclose = () => {
-            console.log('WS closed');
-        };
-
-        ws.onmessage = async (event) => {
-            const data = JSON.parse(event.data);
-
-            if (data.status === 'completed') {
-                await triggerGetDrawing({
-                    id: params.id!,
-                });
-            }
-
-            if (data.status === 'failed') {
-                toast.error('Возникла ошибка обработки чертежа');
-                await triggerGetDrawing({
-                    id: params.id!,
-                });
-            }
-        };
-
-        return () => ws.close();
-    }, [params.id]);
 
     const [isChatOpen, setIsChatOpen] = useState(false);
     return (
@@ -118,7 +99,9 @@ const DrawingPage = () => {
                         data
                             ? data.status === 'processing'
                                 ? true
-                                : false
+                                : pendingRequest
+                                  ? true
+                                  : false
                             : true
                     }
                     askHandler={askHandler}
@@ -149,7 +132,9 @@ const DrawingPage = () => {
                             data
                                 ? data.status === 'processing'
                                     ? true
-                                    : false
+                                    : pendingRequest
+                                      ? true
+                                      : false
                                 : true
                         }
                         askHandler={askHandler}

@@ -7,6 +7,7 @@ from PIL import Image
 from langchain_core.tools import tool
 import easyocr
 import logging 
+from .device import use_cuda
 
 logger = logging.getLogger(__name__)
 
@@ -16,11 +17,12 @@ _ocr_reader = None
 def get_ocr_reader():
     global _ocr_reader
     if _ocr_reader is None:
-        # model_storage_dir указывает, где лежат веса .pth
+        # model_storage_directory указывает, где лежат локальные веса .pth
         _ocr_reader = easyocr.Reader(
             ['ru', 'en'], 
-            gpu=False, 
-            model_storage_dir='/app/models/easyocr'
+            gpu=use_cuda(),
+            model_storage_directory='/app/models/easyocr',
+            download_enabled=False
         )
     return _ocr_reader
 

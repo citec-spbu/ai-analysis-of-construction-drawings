@@ -1,4 +1,5 @@
 __pycache__/
+**/__pycache__/
 *.pyc
 *.pyo
 .env
@@ -7,11 +8,19 @@ logs/
 *.log
 .DS_Store
 venv/
+**/venv/
 .venv/
+**/.venv/
+venv311/
 *.docx
 .idea/
-venv311/
 dataset/
 agent_cache/
 hf_cache/
 checkpoints_data/
+drawing_agent/outputs/
+persistent_storage/
+easyocr_cache/
+install/
+persistent_storage_backup/
+drawing_agent/tests/test_debug.py

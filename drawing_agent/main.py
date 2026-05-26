@@ -1,28 +1,58 @@
 import os
 import logging
 import uvicorn
-import asyncio
-from datetime import datetime
-from typing import List, Optional, Any
-from contextlib import asynccontextmanager
-
 from fastapi import FastAPI, HTTPException, Body
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 from omegaconf import DictConfig
+from contextlib import asynccontextmanager
+from typing import Optional
 
 from app.agent import DrawingAgent
 from rag.vectors import VectorDB
-
-logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
+from rag.embeddings import EmbeddingGenerator
+# Настройка логирования
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s"
+)
 logger = logging.getLogger(__name__)
 
+# Глобальные переменные для ресурсов
 agent_instance: Optional[DrawingAgent] = None
 cfg_global: Optional[DictConfig] = None
+vector_db = VectorDB(index_path="data/faiss_index.bin", metadata_path="data/faiss_metadata.json")
+embedding_gen = EmbeddingGenerator()
 
 
+# --- Lifespan: управление жизненным циклом приложения ---
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global agent_instance, cfg_global
+    logger.info("Initializing Drawing Agent resources...")
+    try:
+        # Создаем экземпляр агента.
+        agent_instance = DrawingAgent(cfg_global, vector_db=vector_db)
+
+        logger.info("Drawing Agent instance created and ready for requests.")
+    except Exception as e:
+        logger.exception(f"Startup failed: {e}")
+
+    yield
+
+    if agent_instance:
+        await agent_instance.close()
+    logger.info("Drawing Agent shutdown complete.")
+
+
+app = FastAPI(title="Drawing Agent API", lifespan=lifespan)
+
+
+# --- Схемы данных ---
 class AnalysisRequest(BaseModel):
     path: str
     question: str
+    # Добавляем поле, чтобы агент не терял UUID из MongoDB
+    drawing_id: Optional[str] = None
     thread_id: Optional[str] = None
     page: int = 0
 
@@ -31,168 +61,159 @@ class SearchRequest(BaseModel):
     query: str
     limit: int = 10
     path: Optional[str] = None
-    drawing_id: Optional[str] = None  # UUID от бэкенда
+    drawing_id: Optional[str] = None
     page: int = 0
 
 
 class PreAnalyzeRequest(BaseModel):
     path: str
-    drawing_id: Optional[str] = None  # Принимаем UUID при индексации
+    drawing_id: Optional[str] = None 
     page: int = 0
 
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    global agent_instance, cfg_global
-    logger.info("Initializing Drawing Agent resources...")
-    try:
-        vector_db = VectorDB()
-        agent_instance = DrawingAgent(cfg_global, vector_db=vector_db)
+def validate_path(path: str) -> str:
+    from urllib.parse import urlparse
+    if "://" in path:
+        parsed = urlparse(path)
+        if parsed.scheme:
+            raise HTTPException(status_code=400, detail="URI not allowed")
 
-        # --- ПРОГРЕВ МОДЕЛИ ---
-        # Инициализируем модель сразу при старте, чтобы не ждать 10 секунд на первом поиске
-        await agent_instance._ensure_initialized()
-        logger.info("Embedding model pre-loaded and Drawing Agent is ready.")
-    except Exception as e:
-        logger.exception(f"Critical startup error: {e}")
-    yield
-    if agent_instance:
-        await agent_instance.close()
-
-
-app = FastAPI(title="Drawing Agent API", lifespan=lifespan)
-
-
-def validate_path(path: Any) -> str:
-    if not isinstance(path, str) or not path or "://" in path:
-        raise HTTPException(status_code=400, detail="Invalid path")
     data_dir = cfg_global.get("data_dir", "/app/dataset") if cfg_global else "/app/dataset"
     sanitized_path = os.path.abspath(os.path.realpath(path))
     allowed_root = os.path.abspath(os.path.realpath(data_dir))
-    if not sanitized_path.startswith(allowed_root):
-        raise HTTPException(status_code=403, detail="Access denied")
+
+    if os.path.commonpath([sanitized_path, allowed_root]) != allowed_root:
+        logger.warning(f"Access denied: {sanitized_path} is outside {allowed_root}")
+        raise HTTPException(status_code=400, detail="Path outside allowed dataset directory")
+
     if not os.path.exists(sanitized_path):
         raise HTTPException(status_code=404, detail="File not found")
+
     return sanitized_path
 
 
-def ensure_string(text: Any) -> str:
-    return str(text) if text is not None else ""
-
-
-@app.post("/search")
-async def search(req: SearchRequest):
-    if not agent_instance:
-        raise HTTPException(status_code=503, detail="Agent not initialized")
-    try:
-        clean_query = ensure_string(req.query)
-
-        # Важная правка логики определения ID
-        drawing_id = req.drawing_id
-
-        # Если бэкенд не прислал UUID, но прислал путь — генерируем хеш
-        # ВАЖНО: этот метод должен быть идентичен тому, что использовался при индексации!
-        if not drawing_id and req.path:
-            valid_path = validate_path(req.path)
-            drawing_id = agent_instance.drawing_knowledge._get_drawing_hash(valid_path, req.page)
-
-        # Глобальный поиск, если drawing_id все еще None
-        logger.info(f"Searching for: '{clean_query}' | Scope: {drawing_id or 'Global'}")
-
-        query_embedding = agent_instance.drawing_knowledge.embed_model.generate(clean_query)
-
-        results = agent_instance.vector_db.search(
-            query_embedding=query_embedding,
-            drawing_id=drawing_id,
-            k=req.limit
-        )
-
-        return {"success": True, "results": results}
-    except Exception as e:
-        logger.exception("Search failed")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.post("/pre-analyze")
-async def pre_analyze(req: PreAnalyzeRequest):
-    if not agent_instance:
-        raise HTTPException(status_code=503, detail="Agent not initialized")
-
-    valid_path = validate_path(req.path)
-
-    # Если бэкенд прислал UUID, используем его. Если нет — используем внутренний хеш.
-    # Это гарантирует, что поиск и индексация всегда используют одну и ту же "ключевую" строку.
-    idx_id = req.drawing_id or agent_instance.drawing_knowledge._get_drawing_hash(valid_path, req.page)
-
-    try:
-        logger.info(f"Indexing drawing: {valid_path} with ID: {idx_id}")
-        result = await agent_instance.pre_analyze(
-            path=valid_path,
-            drawing_id=idx_id,
-            page=req.page
-        )
-        return result
-    except Exception as e:
-        logger.exception("Pre-analysis failed")
-        raise HTTPException(status_code=500, detail=str(e))
-
+# --- Эндпоинты ---
 
 @app.get("/health")
-async def health_check():
-    return {"status": "ok", "timestamp": datetime.now().isoformat()}
+async def health():
+    return {"status": "ok"}
 
 
 @app.get("/ready")
-async def readiness_check():
-    """Проверка доступности агента и его текущей загруженности."""
+async def ready():
+    """
+    Проверка готовности агента.
+    Теперь учитывает блокировку (занят ли агент вычислениями).
+    """
     if agent_instance is None:
         return {"status": "initializing"}
 
+    # Если замок захвачен — значит, идет тяжелый анализ
     if agent_instance.lock.locked():
-        return {"status": "busy", "detail": "Processing another drawing"}
+        return {"status": "busy", "detail": "Agent is currently processing a drawing"}
 
     return {"status": "ready"}
 
 
-
-@app.post("/process")
-async def process(req: AnalysisRequest):
-    """Обработка сложного вопроса к чертежу с использованием LLM-агента."""
-    if not agent_instance:
+@app.post("/pre-analyze")
+async def pre_analyze_drawing(req: PreAnalyzeRequest):
+    logger.info(f"📥 [AGENT] Received pre-analyze: drawing_id={req.drawing_id}, path={req.path}, page={req.page}")
+    if agent_instance is None:
         raise HTTPException(status_code=503, detail="Agent not initialized")
 
-    valid_path = validate_path(req.path)
-    # Защита от пустых вопросов, которые ломают tiktoken
-    clean_question = ensure_string(req.question)
-
-    if not clean_question:
-        raise HTTPException(status_code=400, detail="Question cannot be empty")
+    path = validate_path(req.path)
+    drawing_id = req.drawing_id
+    logger.info(f"Background pre-analysis started for: {path}")
 
     try:
-        logger.info(f"Processing query for {os.path.basename(valid_path)}")
+        result = await agent_instance.pre_analyze(path=path, drawing_id=drawing_id, page=req.page)
 
+        if result.get("success"):
+            return result
+
+        raise HTTPException(status_code=500, detail=result.get("error"))
+    except Exception as e:
+        logger.exception(f"Pre-analysis failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+    
+
+@app.get("/api/search")
+async def search_drawings(q: str, limit: int = 5):
+    """Поиск по локальной векторной базе FAISS."""
+    logger.info(f"🔍 [SEARCH] Local FAISS search: query='{q}', limit={limit}")
+    q = q.strip()
+    if not q:
+        return []
+    
+    try:
+        query_embedding = embedding_gen.generate(q)
+        results = vector_db.search(query_embedding, k=limit)
+        logger.info(f" [SEARCH] Found {len(results)} results")
+        return results
+        
+    except Exception as e:
+        logger.error(f"Search error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+    
+@app.delete("/cache/{drawing_id}")
+async def delete_drawing_cache(drawing_id: str):
+    try:
+        # Вызываем метод пересборки индекса без этого чертежа
+        removed_vectors = vector_db.delete_by_drawing_id(drawing_id)
+        return {
+            "status": "deleted",
+            "drawing_id": drawing_id,
+            "removed_vectors_count": removed_vectors
+        }
+    except Exception as e:
+        logger.error(f"Ошибка при очистке кэша вектора для чертежа {drawing_id}: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error during cache deletion")
+
+
+@app.post("/search")  # ← добавляем то, чего не хватает
+async def search_compat(request: dict):
+    """
+    Совместимость с POST /search (для старого клиента)
+    """
+    query = request.get("query") or request.get("q")
+    limit = request.get("limit", 10)
+    
+    if not query:
+        raise HTTPException(status_code=400, detail="Missing 'query' parameter")
+    
+    logger.info(f"POST /search compatibility endpoint: query='{query}', limit={limit}")
+    
+    # Вызываем существующий GET /api/search
+    return await search_drawings(q=query, limit=limit)
+@app.post("/process")
+async def process_drawing(req: AnalysisRequest):
+    if agent_instance is None:
+        raise HTTPException(status_code=503, detail="Agent not initialized")
+
+    path = validate_path(req.path)
+    logger.info(f"Processing question for: {path} (Thread: {req.thread_id})")
+
+    try:
+        # Метод run тоже под замком внутри агента
         result = await agent_instance.run(
-            path=valid_path,
-            question=clean_question,
+            path=path,
+            question=req.question,
+            drawing_id=req.drawing_id,
             thread_id=req.thread_id,
             page=req.page
         )
 
-        if result and result.get("success"):
+        if result.get("success"):
             return result
 
-        # Если в результате ошибка — приводим её к строке
-        error_detail = ensure_string(result.get("error", "Internal agent error"))
-        raise HTTPException(status_code=500, detail=error_detail)
+        raise HTTPException(status_code=500, detail=result.get("error"))
 
     except Exception as e:
-        logger.exception("Drawing processing error")
-        # Тщательная очистка сообщения об ошибке для API
-        raise HTTPException(status_code=500, detail=ensure_string(str(e)))
+        logger.exception(f"Process drawing error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
-# --- Запуск ---
-
+# --- Точка входа ---
 def run_server(cfg: DictConfig):
     global cfg_global
     cfg_global = cfg
@@ -202,7 +223,7 @@ def run_server(cfg: DictConfig):
         host="0.0.0.0",
         port=8000,
         log_level="info",
-        timeout_keep_alive=600  # Увеличенный таймаут для тяжелых PDF
+        timeout_keep_alive=600
     )
 
 
